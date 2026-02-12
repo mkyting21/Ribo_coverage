@@ -19,7 +19,7 @@ parser <- OptionParser(option_list = option_list)
 opt <- parse_args(parser)
 #stop the script if not all options are used
 if( length(opt) < 6 ){
-  print("ERROR: some arguments are blank. Refer to -h ")
+  print("ERROR: all arguments must be selected. Refer to -h ")
   stop()
 }
 
