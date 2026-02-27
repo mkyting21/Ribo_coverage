@@ -31,7 +31,6 @@ if(length(commandArgs(trailingOnly = TRUE)) == 0){
   opt$psite <- "data/test_data/test_psite.wig"
   opt$genes <- "data/test_data/test_genes.txt"
 }
-
 cat( "My variables:", "\n", 
  "annotation = ", opt$annotation, "\n",
  "rna = ", opt$rna, "\n",
@@ -40,18 +39,17 @@ cat( "My variables:", "\n",
  "genes = ", opt$genes, "\n" 
 )
 
-# Dependencies -----------------------------------------------------------
+# Main Dependencies ------------------------------------------------------
 library("tools") 
 library("rtracklayer") #importing gtf and bedgraphs
 library("tidyverse")
 library("ggtranscript") #geom_gene function for visualizing transcript annotations
 library("cowplot") #stick together multiple plots
 
-
-# Main -------------------------------------------------------------------
+# Main Script ------------------------------------------------------------
 
 #detect file format of a genome coverage file. This function is used with Rtracklayer::import()
-identify_file_format <- function(file_name){
+identify_format <- function(file_name){
   file_extension <- file_name %>% file_ext() %>% str_to_lower()
   if( file_extension %in% c("bedgraph", "bg") ){ 
     file_format <- "bedGraph"
@@ -70,16 +68,12 @@ my_gtf <- import(opt$annotation)
 my_gene_list <- readLines(opt$genes)
 
 create_plots <- function(my_gene_id){
-  #extract gene information
   gene_gtf <- my_gtf[ mcols(my_gtf)$gene_id %in% my_gene_id ] 
-  gene_name <- unique( gene_gtf$gene_name )
   if( length(gene_gtf) <1){ 
-    print("gene_name not found in annotation file")
+    print("Error: gene_name not found in annotation file")
     stop()
-  }
+  }  
   gene_info <- gene_gtf[ gene_gtf$type == "gene" ] %>% as.data.frame()
-  transcripts_gtf <- gene_gtf[gene_gtf$type != "gene"] %>% as.data.frame()
-  x_axis_limits <- c( gene_info$start, gene_info$end) #all plots must have same coordinate cartesians to align
 
   #import coverage info that overlaps with the gene gtf
   coverage_rna <- import(opt$rna, format = identify_format(opt$rna), which = gene_gtf) 
@@ -87,26 +81,29 @@ create_plots <- function(my_gene_id){
   coverage_psite <- import(opt$psite, format = identify_format(opt$psite), which = gene_gtf)
 
   #If the region of interest has 0 coverage, fill it in with default values
-  check_coverage <- function(coverage_file){    
+  check_coverage <- function(coverage_file, data_type){    
     if( length(coverage_file) == 0){      
       coverage_file <- gene_info 
       coverage_file$score <- 0
     }
-    return( as.data.frame(coverage_file) ) 
-  }
-  coverage_rna <- check_coverage(coverage_rna)
-  coverage_ribo <- check_coverage(coverage_ribo)
-  coverage_psite <- check_coverage(coverage_psite)
-
-  #add a data type, used for ggplot
-  coverage_ribo$type <- "ribo"
-  coverage_psite$type <- "ribo"
-  coverage_rna$type <- "rna"
+    df <- as.data.frame(coverage_file)
+    df$type <- data_type
+    return(df)
+  }  
+  coverage_rna <- check_coverage(coverage_rna, "rna")
+  coverage_ribo <- check_coverage(coverage_ribo, "ribo")
+  coverage_psite <- check_coverage(coverage_psite, "ribo")
 
   #plot transcript features
+  x_axis_limits <- c(gene_info$start, gene_info$end)
+  gene_strand <- gene_info$strand
+  gene_name <- unique( gene_gtf$gene_name )
+  transcripts_gtf <- gene_gtf[gene_gtf$type != "gene"] %>% as.data.frame()
+
   features_plot <- ggplot( transcripts_gtf, aes(xstart = start, xend = end, y = transcript_id) )  + theme_bw()+
     geom_intron( aes(strand = strand), arrow.min.intron.length = 100000) +
-    geom_range(data = filter(transcripts_gtf, type == "exon"), fill = "white", height = 0.25) +
+    geom_range(data = filter(transcripts_gtf, type == "exon"), fill = "white", height = 0.15) +
+    geom_range(data = filter(transcripts_gtf, type == "CDS"), fill = "grey", height = 0.25) +  
     labs(y = "") + 
     coord_cartesian(xlim = x_axis_limits) +
     theme(legend.position = "none",
