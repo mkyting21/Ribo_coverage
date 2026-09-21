@@ -1,150 +1,173 @@
 #combined coverage plots for rna-seq and ribo-seq 
 
 # Command line options ---------------------------------------------------
-library("optparse")
+suppressPackageStartupMessages(library("optparse"))
+
 option_list <- list(
-  make_option( c("-g", "--genes"), type = "character", default = NULL, metavar = "character",
+  make_option(c("-g", "--genes"), type = "character", default = NULL, metavar = "character",
     help = "File with all gene_ids of interest. Each id should be on a new line"),
-  make_option( c("-a", "--annotation"), type = "character", default = NULL, metavar = "character",
+  make_option(c("-a", "--annotation"), type = "character", default = NULL, metavar = "character",
     help = "gtf annotation file"),
-  make_option( c("--rna"), type = "character", default = NULL, metavar = "character",
+  make_option("--rna", type = "character", default = NULL, metavar = "character",
     help = "rnaseq coverage file: bigWig (recommended) or bedgraph format"),
-  make_option( c("--ribo"), type = "character", default = NULL, metavar = "character",
+  make_option("--ribo", type = "character", default = NULL, metavar = "character",
     help = "riboseq coverage file: bigWig (recommended) or bedgraph format"),
-  make_option( c("--psite_F"), type = "character", default = NULL, metavar = "character",
+  make_option("--psite", type = "character", default = NULL, metavar = "character",
     help = "Psite file: bigwig (recommended) or wig format")
 )
-parser <- OptionParser(option_list = option_list)
-opt <- parse_args(parser)
-#stop the script if not all options are used
-if( length(opt) < 6 ){
-  print("ERROR: all arguments must be selected. Refer to -h ")
-  stop()
+
+required <- c("genes", "annotation", "rna", "ribo", "psite")
+
+if (interactive()) {
+  # When running interactively, set file paths manually
+  opt <- list(
+    annotation = "data/test_data/test.gtf",
+    rna        = "data/test_data/test_rna.bedgraph",
+    ribo       = "data/test_data/test_ribo.bedgraph",
+    psite      = "data/test_data/test_psite.wig",
+    genes      = "data/test_data/test_genes.txt"
+  )
+} else {
+  opt <- parse_args(OptionParser(option_list = option_list))
+  missing_opts <- required[vapply(opt[required], is.null, logical(1))]
+  if (length(missing_opts) > 0) {
+    stop("All arguments must be supplied. Missing: ",
+         paste0("--", missing_opts, collapse = ", "), ". Refer to -h", call. = FALSE)
+  }
 }
 
-#If running interactively, run this and enter file paths manually 
-if(length(commandArgs(trailingOnly = TRUE)) == 0){
-  opt <- list()
-  opt$annotation <- "data/test_data/test.gtf"
-  opt$rna <- "data/test_data/test_rna.bedgraph"
-  opt$ribo <- "data/test_data/test_ribo.bedgraph"
-  opt$psite <- "data/test_data/test_psite.wig"
-  opt$genes <- "data/test_data/test_genes.txt"
+not_found <- required[!file.exists(unlist(opt[required]))]
+if (length(not_found) > 0) {
+  stop("File not found for: ", paste(not_found, collapse = ", "), call. = FALSE)
 }
-cat( "My variables:", "\n", 
- "annotation = ", opt$annotation, "\n",
- "rna = ", opt$rna, "\n",
- "ribo = ", opt$ribo, "\n",
- "psite = ", opt$psite, "\n",
- "genes = ", opt$genes, "\n" 
-)
+
+cat("My variables:\n", paste0(" ", names(opt[required]), " = ", unlist(opt[required]), "\n"), sep = "")
 
 # Main Dependencies ------------------------------------------------------
-library("tools") 
-library("rtracklayer") #importing gtf and bedgraphs
-library("tidyverse")
-library("ggtranscript") #geom_gene function for visualizing transcript annotations
-library("cowplot") #stick together multiple plots
+suppressPackageStartupMessages({
+  library("tools")
+  library("rtracklayer")    # importing gtf, bedgraph, bigwig, wig
+  library("GenomicRanges")
+  library("ggplot2")
+  library("dplyr")
+  library("purrr")
+  library("ggtranscript")   # geom_range / geom_intron for transcript annotations
+  library("cowplot")        # stick together multiple plots
+})
 
-# Main Script ------------------------------------------------------------
+# Helper functions -------------------------------------------------------
 
-#detect file format of a genome coverage file. This function is used with Rtracklayer::import()
-identify_format <- function(file_name){
-  file_extension <- file_name %>% file_ext() %>% str_to_lower()
-  if( file_extension %in% c("bedgraph", "bg") ){ 
-    file_format <- "bedGraph"
-  }else if( file_extension %in% c("bigwig", "bw") ){
-    file_format <- "BigWig"
-  }else if( file_extension %in% c("wig") ){
-    file_format <- "wig"
-  }else( 
-    paste0("ERROR: invalid filetype for ", file_name)
-  )  
-  return(file_format)
+# Detect file format of a coverage file, for use with rtracklayer::import()
+identify_format <- function(file_name) {
+  switch(tolower(file_ext(file_name)),
+    bedgraph = , bg = "bedGraph",
+    bigwig   = , bw = "BigWig",
+    wig      = "wig",
+    stop("Invalid file type for ", file_name, call. = FALSE)
+  )
 }
 
-#get gene info
-my_gtf <- import(opt$annotation) 
-my_gene_list <- readLines(opt$genes)
+# Returns a function(region) -> GRanges of coverage overlapping `region`.
+# BigWig files are indexed, so they are queried per region.
+# bedGraph/wig files cannot be queried efficiently, so they are read ONCE
+# here and subset in memory (instead of re-reading the whole file per gene).
+make_coverage_reader <- function(path) {
+  fmt <- identify_format(path)
+  if (fmt == "BigWig") {
+    function(region) import(path, format = fmt, which = region)
+  } else {
+    cov <- import(path, format = fmt)
+    function(region) subsetByOverlaps(cov, region)
+  }
+}
 
-create_plots <- function(my_gene_id){
-  gene_gtf <- my_gtf[ mcols(my_gtf)$gene_id %in% my_gene_id ] 
-  if( length(gene_gtf) <1){ 
-    print("Error: gene_name not found in annotation file")
-    stop()
-  }  
-  gene_info <- gene_gtf[ gene_gtf$type == "gene" ] %>% as.data.frame()
+# Convert coverage to a data.frame; if the region has no coverage,
+# fill it with a single zero-score row spanning the gene
+coverage_df <- function(gr, type, region) {
+  if (length(gr) == 0) {
+    return(data.frame(start = start(region), end = end(region), score = 0, type = type))
+  }
+  df <- as.data.frame(gr)
+  df$type <- type
+  df
+}
 
-  #import coverage info that overlaps with the gene gtf
-  coverage_rna <- import(opt$rna, format = identify_format(opt$rna), which = gene_gtf) 
-  coverage_ribo  <- import(opt$ribo, format = identify_format(opt$ribo), which = gene_gtf)
-  coverage_psite <- import(opt$psite, format = identify_format(opt$psite), which = gene_gtf)
-
-  #If the region of interest has 0 coverage, fill it in with default values
-  check_coverage <- function(coverage_file, data_type){    
-    if( length(coverage_file) == 0){      
-      coverage_file <- gene_info 
-      coverage_file$score <- 0
-    }
-    df <- as.data.frame(coverage_file)
-    df$type <- data_type
-    return(df)
-  }  
-  coverage_rna <- check_coverage(coverage_rna, "rna")
-  coverage_ribo <- check_coverage(coverage_ribo, "ribo")
-  coverage_psite <- check_coverage(coverage_psite, "ribo")
-
-  #plot transcript features
-  x_axis_limits <- c(gene_info$start, gene_info$end)
-  gene_strand <- gene_info$strand
-  gene_name <- unique( gene_gtf$gene_name )
-  transcripts_gtf <- gene_gtf[gene_gtf$type != "gene"] %>% as.data.frame()
-
-  features_plot <- ggplot( transcripts_gtf, aes(xstart = start, xend = end, y = transcript_id) )  + theme_bw()+
-    geom_intron( aes(strand = strand), arrow.min.intron.length = 100000) +
-    geom_range(data = filter(transcripts_gtf, type == "exon"), fill = "white", height = 0.15) +
-    geom_range(data = filter(transcripts_gtf, type == "CDS"), fill = "grey", height = 0.25) +  
-    labs(y = "") + 
-    coord_cartesian(xlim = x_axis_limits) +
-    theme(legend.position = "none",
-          plot.margin = unit( c(0,0,0,0), "mm") )
-  
-  #plot rna coverage 
-  rna_plot <- ggplot(coverage_rna) + theme_bw() +
-    geom_rect( aes( xmin = start, xmax = end, ymin = 0, ymax = score), 
-      fill = "#756bb1",
-      color = NA) +
+# One coverage panel (shared by RNA and Ribo plots)
+coverage_panel <- function(df, fill, x_limits) {
+  ggplot(df) + theme_bw() +
+    geom_rect(aes(xmin = start, xmax = end, ymin = 0, ymax = score),
+              fill = fill, color = NA) +
     labs(y = "coverage", x = "") +
     facet_wrap(~type, strip.position = "right") +
+    coord_cartesian(xlim = x_limits) +
+    theme(legend.position = "none",
+          plot.margin = unit(c(0, 0, 0, 0), "mm"),
+          axis.text.x = element_blank())
+}
+
+# Load data once ---------------------------------------------------------
+# Only keep the feature types that are actually plotted
+my_gtf <- import(opt$annotation, feature.type = c("gene", "transcript", "exon", "CDS"))
+gtf_by_gene <- split(my_gtf, my_gtf$gene_id)   # split once instead of filtering per gene
+
+my_gene_list <- readLines(opt$genes) %>% trimws() %>% unique()
+my_gene_list <- my_gene_list[nzchar(my_gene_list)]
+
+read_rna   <- make_coverage_reader(opt$rna)
+read_ribo  <- make_coverage_reader(opt$ribo)
+read_psite <- make_coverage_reader(opt$psite)
+
+# Main function ----------------------------------------------------------
+create_plots <- function(my_gene_id) {
+  if (!my_gene_id %in% names(gtf_by_gene)) {
+    stop("gene_id not found in annotation file", call. = FALSE)
+  }
+  gene_gtf <- gtf_by_gene[[my_gene_id]]
+
+  # Region spanning the whole gene (used for coverage queries and x-axis)
+  region <- range(gene_gtf, ignore.strand = TRUE)
+  x_axis_limits <- c(start(region), end(region))
+
+  coverage_rna   <- coverage_df(read_rna(region),   "rna",  region)
+  coverage_ribo  <- coverage_df(read_ribo(region),  "ribo", region)
+  coverage_psite <- coverage_df(read_psite(region), "ribo", region)  # same facet as ribo
+
+  # Gene label for file names (fall back to the id if there is no gene_name)
+  gene_name <- unique(na.omit(as.character(mcols(gene_gtf)$gene_name)))
+  file_stub <- paste(unique(c(my_gene_id, gene_name[seq_len(min(1, length(gene_name)))])),
+                     collapse = "_")
+
+  # Transcript features
+  transcripts_gtf <- as.data.frame(gene_gtf[gene_gtf$type != "gene"])
+
+  features_plot <- ggplot(transcripts_gtf, aes(xstart = start, xend = end, y = transcript_id)) +
+    theme_bw() +
+    geom_intron(data = filter(transcripts_gtf, type == "transcript"),
+                aes(strand = strand), arrow.min.intron.length = 100000) +
+    geom_range(data = filter(transcripts_gtf, type == "exon"), fill = "white", height = 0.15) +
+    geom_range(data = filter(transcripts_gtf, type == "CDS"),  fill = "grey",  height = 0.25) +
+    labs(y = "") +
     coord_cartesian(xlim = x_axis_limits) +
     theme(legend.position = "none",
-          plot.margin = unit( c(0,0,0,0), "mm"), 
-          axis.text.x = element_blank()
-        )
-  
-  #plot riboseq coverage
-  ribo_plot <- ggplot(coverage_ribo, aes(x = start, y = score) ) + theme_bw() +
-    geom_rect( aes( xmin = start, xmax = end, ymin = 0, ymax = score), 
-      fill = "#31a354",
-      color = NA) +
-    labs(y = "coverage", x = "") + 
-    geom_col( data = coverage_psite, aes(x = start, y = score), color = "red" ) +
-    facet_wrap(~type, strip.position = "right") +
-    coord_cartesian(xlim = x_axis_limits) +  
-    theme(legend.position = "none",
-          plot.margin = unit( c(0,0,0,0), "mm"),
-          axis.text.x = element_blank()
-        )
+          plot.margin = unit(c(0, 0, 0, 0), "mm"))
 
-  #combine plots and save
-  final_plot <- plot_grid( rna_plot, ribo_plot, features_plot, nrow = 3, rel_heights = c(2, 2, 1), align = "v", axis = "lr")  
-  pdf( file = paste0( my_gene_id, "_", gene_name, "-coverage_plot.pdf"), width = 5, height = 5 )
-  print(final_plot)
-  dev.off()
+  # Coverage panels
+  rna_plot  <- coverage_panel(coverage_rna, "#756bb1", x_axis_limits)
+  ribo_plot <- coverage_panel(coverage_ribo, "#31a354", x_axis_limits) +
+    geom_col(data = coverage_psite, aes(x = start, y = score),
+             fill = "red", color = NA, width = 1)
 
-  png( file = paste0( my_gene_id, "_", gene_name, "-coverage_plot.png"), res = 300, width = 1200, height = 1200)
-  print(final_plot)
-  dev.off()
+  # Combine and save
+  final_plot <- plot_grid(rna_plot, ribo_plot, features_plot,
+                          nrow = 3, rel_heights = c(2, 2, 1), align = "v", axis = "lr")
 
+  ggsave(paste0(file_stub, "-coverage_plot.pdf"), final_plot, width = 5, height = 5)
+  ggsave(paste0(file_stub, "-coverage_plot.png"), final_plot, width = 4, height = 4, dpi = 300)
+
+  invisible(NULL)
 }
-map(my_gene_list, create_plots)
+
+walk(my_gene_list, function(g) {
+  tryCatch(create_plots(g),
+           error = function(e) message("Skipping ", g, ": ", conditionMessage(e)))
+})
